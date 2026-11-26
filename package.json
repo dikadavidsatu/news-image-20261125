@@ -1,0 +1,1 @@
+{"description":"One Image: Wednesday 25 November 2026 — the day's world news in a single 1024x1024 PNG.","name":"news-image-20261125","private":true,"scripts":{"render":"python3 render.py","verify":"MAKEFUN_OUTPUT_DIR=/tmp/out node main.ts"},"type":"module"}
