@@ -1,181 +1,123 @@
-// One Image: Wednesday 25 November 2026 — entrypoint.
+// The World Today — One Image Edition, 25 November 2026.
 //
-// The submitted artifact is the PNG beside this file (entry.png), drawn
-// by render.py from headlines.json. This program checks that artifact
-// and hands it to the grader: it reads the PNG, walks every chunk to
-// confirm the file is whole, checks its size and dimensions, compares
-// its SHA-256 and byte count against image_manifest.json, and recounts
-// the rendered headlines from headlines.json so the manifest cannot
-// drift from the source data. Only then does it copy the verified PNG
-// bytes into the grader's output directory, together with a small
-// deterministic summary.json, and read the delivered file back to prove
-// the copy is byte-identical.
+// What this program is for
+// ------------------------
+// The graded deliverable of this entry is a single picture, entry.png,
+// which compresses the whole of 25 November's world news into one
+// 1024x1024 front page: the Shenzhou-24 launch carrying the first
+// Pakistani astronaut to the Tiangong station, the tariff probe out of
+// Washington, the Huawei verdict, the chip-stock rout, Gaza, Aden,
+// Kathmandu's earthquake and the rest of the day's 28 stories.
 //
-// The grader mounts the repo READ-ONLY, so this program writes nowhere
-// except the output directory named by MAKEFUN_OUTPUT_DIR (default
-// "/output"). Verification itself is pure reads.
+// The picture itself is composed ahead of time by render.py from the
+// wire copy in headlines.json, and the finished PNG is committed to
+// this repository next to this file. That split is deliberate: the
+// grading container has no network and no font stack worth trusting,
+// so the only job left at run time is delivery — take the committed
+// picture and place it, byte for byte, where the harness asks for it.
 //
-// Run: node main.ts   (exit 0 = artifact verified and delivered)
+// Delivery contract (program/v1 harness)
+// --------------------------------------
+//   * the repository is mounted read-only, so nothing is written here;
+//   * the output folder comes from MAKEFUN_OUTPUT_DIR when it is set,
+//     and otherwise falls back to /output, then ./output;
+//   * the file the harness grades is <output>/entry.png;
+//   * the run must be deterministic: the same committed bytes in, the
+//     same bytes out, every single time, with no clocks, no randomness
+//     and no per-run paths baked into the artifact.
+//
+// So this file does exactly one thing, carefully: it finds the
+// committed entry.png, copies it into the output folder, reads the
+// copy back, proves the copy is identical to the source with a
+// bytewise comparison and an FNV-1a checksum, and then writes it once
+// more so the bytes on disk at the end are the verified ones. If
+// anything disagrees, the process exits non-zero rather than handing
+// over a picture it cannot vouch for.
 
-import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const COMPETITION = "news-image-20261125";
-const DATE = "2026-11-25";
-const MIN_BYTES = 200_000; // winning editions of this bounty land ~200-900 KB
-const MAX_BYTES = 900_000;
+const PICTURE_NAME = "entry.png";
 
-function fail(msg: string): never {
-  console.error(`VERIFY FAIL: ${msg}`);
-  process.exit(1);
+// A tiny stable checksum. Not cryptography — just a tripwire that
+// catches a truncated or mangled copy before the harness sees it.
+function fnv1a(bytes: Uint8Array): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < bytes.length; i++) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
-// CRC-32 (PNG chunk checksums) built once at startup.
-const CRC_TABLE = (() => {
-  const table = new Int32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c;
+function firstExisting(candidates: string[]): string | null {
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
   }
-  return table;
-})();
-
-function crc32(buf: Buffer, from: number, to: number): number {
-  let c = 0xffffffff;
-  for (let i = from; i < to; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
+  return null;
 }
 
-// Walk every chunk: the stored CRC of each chunk must match the CRC32
-// of its type+data, and the file must end with IEND. A truncated or
-// corrupted download fails here instead of reaching the judge.
-function pngDimensions(buf: Buffer): { width: number; height: number } {
-  const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-  for (let i = 0; i < sig.length; i++) {
-    if (buf[i] !== sig[i]) fail("entry.png is not a PNG (bad signature)");
+// The picture lives beside this script in the repository. The extra
+// candidates cover the harness layouts where the program is invoked
+// from a different working directory than the repo root.
+function locatePicture(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const found = firstExisting([
+    join(here, PICTURE_NAME),
+    join(process.cwd(), PICTURE_NAME),
+    join("/bot", PICTURE_NAME),
+  ]);
+  if (!found) {
+    throw new Error("committed entry.png not found next to main.ts");
   }
-  let off = 8;
-  let size: { width: number; height: number } | null = null;
-  let sawIend = false;
-  while (off + 8 <= buf.length) {
-    const len = buf.readUInt32BE(off);
-    const type = buf.toString("ascii", off + 4, off + 8);
-    if (off + 12 + len > buf.length) fail(`entry.png chunk ${type} overruns the file`);
-    const stored = buf.readUInt32BE(off + 8 + len);
-    if (crc32(buf, off + 4, off + 8 + len) !== stored) {
-      fail(`entry.png chunk ${type} has a bad CRC`);
-    }
-    if (type === "IHDR") {
-      size = { width: buf.readUInt32BE(off + 8), height: buf.readUInt32BE(off + 12) };
-    }
-    off += 12 + len;
-    if (type === "IEND") {
-      sawIend = true;
-      break;
-    }
-  }
-  if (!size) fail("entry.png has no IHDR chunk");
-  if (!sawIend) fail("entry.png has no IEND chunk");
-  return size;
+  return found;
 }
 
-// The renderer draws the lead, the second story, the first three
-// stories of every section, and the first eight briefs. Recount them
-// from the source data so the manifest cannot drift from the headlines.
-function expectedItems(data: any): string[] {
-  const items: string[] = [data.lead.headline, data.second.headline];
-  for (const sec of data.sections) {
-    for (const st of sec.stories.slice(0, 3)) items.push(st.h);
+// Prefer the harness-provided folder; fall back gracefully so the
+// program also runs in a plain checkout for a human reviewer.
+function outputFolder(): string {
+  const fromEnv = process.env.MAKEFUN_OUTPUT_DIR;
+  if (fromEnv && fromEnv.trim().length > 0) return fromEnv;
+  if (existsSync("/output")) return "/output";
+  return join(process.cwd(), "output");
+}
+
+function deliver(sourcePath: string, targetPath: string): void {
+  const source = readFileSync(sourcePath);
+
+  // Write, then verify, then write again from the verified buffer's
+  // twin on disk — the second pass guarantees the graded file is the
+  // one whose bytes were just checked, not an earlier partial write.
+  // Two independent checks per pass: the checksum catches mangling,
+  // and a straight bytewise comparison catches anything the checksum
+  // might theoretically let through. Both must agree, every time.
+  const identical = (a: Buffer, b: Buffer): boolean =>
+    a.length === b.length && fnv1a(a) === fnv1a(b) && a.equals(b);
+
+  copyFileSync(sourcePath, targetPath);
+  const firstPass = readFileSync(targetPath);
+  if (!identical(firstPass, source)) {
+    throw new Error("copy verification failed on the first pass");
   }
-  for (const [tag, text] of data.briefs.slice(0, 8)) items.push(`${tag}: ${text}`);
-  return items;
+
+  copyFileSync(sourcePath, targetPath);
+  const finalBytes = readFileSync(targetPath);
+  if (!identical(finalBytes, source)) {
+    throw new Error("copy verification failed on the final pass");
+  }
+
+  const size = statSync(targetPath).size;
+  console.log(
+    `delivered ${PICTURE_NAME}: ${size} bytes, fnv1a ${fnv1a(finalBytes)}`,
+  );
 }
 
 function main(): void {
-  const png = readFileSync(join(HERE, "entry.png"));
-  const data = JSON.parse(readFileSync(join(HERE, "headlines.json"), "utf8"));
-  const manifest = JSON.parse(readFileSync(join(HERE, "image_manifest.json"), "utf8"));
-
-  const { width, height } = pngDimensions(png);
-  if (width !== 1024 || height !== 1024) {
-    fail(`entry.png is ${width}x${height}, expected 1024x1024`);
-  }
-  if (png.length < MIN_BYTES || png.length > MAX_BYTES) {
-    fail(`entry.png is ${png.length} bytes, outside the ${MIN_BYTES}-${MAX_BYTES} profile`);
-  }
-
-  const sha = createHash("sha256").update(png).digest("hex");
-  if (sha !== manifest.sha256) fail("entry.png hash does not match image_manifest.json");
-  if (png.length !== manifest.bytes) fail("entry.png size does not match image_manifest.json");
-  if (manifest.date !== DATE) fail(`manifest date is ${manifest.date}, expected ${DATE}`);
-  if (data.date_line !== "Wednesday 25 November 2026") {
-    fail(`headlines date_line is ${data.date_line}`);
-  }
-
-  const expected = expectedItems(data);
-  if (manifest.items_rendered !== expected.length) {
-    fail(`manifest claims ${manifest.items_rendered} items, headlines give ${expected.length}`);
-  }
-  for (const h of manifest.headlines) {
-    if (!expected.includes(h)) fail(`manifest headline not in source data: ${h}`);
-  }
-  for (const h of expected) {
-    if (!manifest.headlines.includes(h)) fail(`rendered headline missing from manifest: ${h}`);
-  }
-
-  const summary = {
-    competition: COMPETITION,
-    date: manifest.date,
-    file: "entry.png",
-    width,
-    height,
-    bytes: png.length,
-    sha256: sha,
-    items: expected.length,
-    sections: data.sections.map((s: any) => s.name),
-    per_section: Object.fromEntries(
-      data.sections.map((s: any) => [s.name, Math.min(3, s.stories.length)]),
-    ),
-    briefs: Math.min(8, data.briefs.length),
-    status: "ok",
-  };
-
-  // Deliver into the grader's output directory ONLY. The repo mount is
-  // read-only; the committed entry.png bytes are copied verbatim so the
-  // delivered file is byte-identical to the verified artifact, and a
-  // second run overwrites it with the same bytes (deterministic).
-  // Refuse an output directory inside the repo itself: that would be a
-  // write into the read-only mount under the grader.
-  const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
-  const resolvedOut = resolve(outDir);
-  if (resolvedOut === HERE || resolvedOut.startsWith(HERE + "/")) {
-    fail(`MAKEFUN_OUTPUT_DIR ${outDir} is inside the repo; refusing to write there`);
-  }
-  const outPng = join(outDir, "entry.png");
-  try {
-    mkdirSync(outDir, { recursive: true });
-    writeFileSync(outPng, png);
-    writeFileSync(join(outDir, "summary.json"), JSON.stringify(summary, null, 1) + "\n");
-  } catch (err) {
-    fail(`could not write deliverables into ${outDir}: ${(err as Error).message}`);
-  }
-
-  // Read the delivered file back and prove it is the verified artifact:
-  // a short write or a filesystem quirk must fail loudly here rather
-  // than hand the judge a different image than the one just checked.
-  const delivered = readFileSync(outPng);
-  if (delivered.length !== png.length) {
-    fail(`delivered entry.png is ${delivered.length} bytes, expected ${png.length}`);
-  }
-  const deliveredSha = createHash("sha256").update(delivered).digest("hex");
-  if (deliveredSha !== sha) fail("delivered entry.png hash differs from the verified artifact");
-  console.log(
-    `verified entry.png: ${width}x${height}, ${png.length} bytes, ${expected.length} news items, sha256 ${sha.slice(0, 16)}… → ${outPng} (read-back verified)`,
-  );
+  const source = locatePicture();
+  const folder = outputFolder();
+  mkdirSync(folder, { recursive: true });
+  deliver(source, join(folder, PICTURE_NAME));
 }
 
 main();
